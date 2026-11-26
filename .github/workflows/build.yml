@@ -74,9 +74,14 @@ jobs:
             gradle clean assembleDebug assembleRelease
           fi
 
-      - name: Find, Rename, and Extract Version
+      - name: Find, Auto-Sign Release, Rename, and Extract Version
         id: ver
         working-directory: ${{ env.PROJ_DIR }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASS }}
         run: |
           # 1. Ambil Version Name dari build.gradle
           VN=$(grep -rhoE 'versionName *= *"[^"]+"' --include=build.gradle.kts --include=build.gradle . | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
@@ -92,10 +97,72 @@ jobs:
             cp "$DEBUG_APK" "$GITHUB_WORKSPACE/${APP_NAME}-v${VN}-debug-${RUN_NUM}.apk"
           fi
 
-          # 3. Cari dan Rename APK Release
+          # 3. Cari, Auto-Sign (jika unsigned), dan Rename APK Release
           RELEASE_APK=$(find . -path "*/build/outputs/apk/release/*.apk" | head -n 1)
-          if [ -n "$RELEASE_APK" ]; then 
-            cp "$RELEASE_APK" "$GITHUB_WORKSPACE/${APP_NAME}-v${VN}-release-${RUN_NUM}.apk"
+          if [ -n "$RELEASE_APK" ]; then
+            OUT_RELEASE="$GITHUB_WORKSPACE/${APP_NAME}-v${VN}-release-${RUN_NUM}.apk"
+            SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+            BT_DIR=$(ls -d "$SDK_ROOT"/build-tools/* 2>/dev/null | sort -V | tail -n 1)
+
+            if [ -z "$BT_DIR" ] && [ -n "$SDK_ROOT" ]; then
+              SDKMAN=$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager 2>/dev/null | head -n 1)
+              if [ -n "$SDKMAN" ]; then
+                yes | "$SDKMAN" "build-tools;34.0.0" >/dev/null || true
+                BT_DIR=$(ls -d "$SDK_ROOT"/build-tools/* 2>/dev/null | sort -V | tail -n 1)
+              fi
+            fi
+
+            if [ -n "$BT_DIR" ] && [ -x "$BT_DIR/apksigner" ]; then
+              if "$BT_DIR/apksigner" verify "$RELEASE_APK" >/dev/null 2>&1; then
+                echo "APK Release sudah ter-sign, langsung disalin."
+                cp "$RELEASE_APK" "$OUT_RELEASE"
+              else
+                echo "APK Release masih unsigned! Menjalankan zipalign + apksigner..."
+                ALIGNED_APK="/tmp/release-aligned.apk"
+                if [ -x "$BT_DIR/zipalign" ]; then
+                  "$BT_DIR/zipalign" -p -f 4 "$RELEASE_APK" "$ALIGNED_APK"
+                else
+                  cp "$RELEASE_APK" "$ALIGNED_APK"
+                fi
+
+                if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASS" ] && [ -n "$KEY_ALIAS" ]; then
+                  echo "Menandatangani dengan Keystore Permanen (GitHub Secrets)."
+                  printf '%s' "$KEYSTORE_BASE64" | tr -d ' \r\n' | base64 -d > /tmp/release.jks
+                  export KS_PATH="/tmp/release.jks"
+                  export KS_PASS="$KEYSTORE_PASS"
+                  export KS_ALIAS="$KEY_ALIAS"
+                  export K_PASS="${KEY_PASS:-$KEYSTORE_PASS}"
+                else
+                  echo "Secrets tidak diset -> menggunakan debug.keystore otomatis."
+                  if [ ! -f "$HOME/.android/debug.keystore" ]; then
+                    mkdir -p "$HOME/.android"
+                    keytool -genkey -v -keystore "$HOME/.android/debug.keystore" \
+                      -storepass android -alias androiddebugkey -keypass android \
+                      -keyalg RSA -keysize 2048 -validity 10000 \
+                      -dname "CN=Android Debug,O=Android,C=US"
+                  fi
+                  export KS_PATH="$HOME/.android/debug.keystore"
+                  export KS_PASS="android"
+                  export KS_ALIAS="androiddebugkey"
+                  export K_PASS="android"
+                fi
+
+                "$BT_DIR/apksigner" sign \
+                  --ks "$KS_PATH" \
+                  --ks-pass env:KS_PASS \
+                  --ks-key-alias "$KS_ALIAS" \
+                  --key-pass env:K_PASS \
+                  --out "$OUT_RELEASE" \
+                  "$ALIGNED_APK"
+
+                "$BT_DIR/apksigner" verify "$OUT_RELEASE"
+                echo "APK Release berhasil di-sign dan diverifikasi!"
+                rm -f /tmp/release.jks "$ALIGNED_APK"
+              fi
+            else
+              echo "Peringatan: apksigner tidak ditemukan, menyalin APK apa adanya."
+              cp "$RELEASE_APK" "$OUT_RELEASE"
+            fi
           fi
 
           # 4. Simpan Tag Rilis
